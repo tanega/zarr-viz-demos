@@ -1,7 +1,7 @@
 # GPU-accelerated Zarr visualization — learnings log
 
-Exploring two stacks for visualizing large Zarr datasets on the GPU, each with
-a Svelte + Vite frontend:
+Exploring GPU-accelerated Zarr visualization stacks across frontend
+frameworks, all against the same public ECMWF IFS ENS Zarr v3 dataset:
 
 1. `svelte-deckgl-raster/` — [deck.gl-raster](https://github.com/developmentseed/deck.gl-raster)
    (`@developmentseed/deck.gl-raster` + `@developmentseed/deck.gl-zarr`),
@@ -9,6 +9,9 @@ a Svelte + Vite frontend:
    [`examples/dynamical-zarr-ecmwf`](https://github.com/developmentseed/deck.gl-raster/tree/main/examples/dynamical-zarr-ecmwf).
 2. `svelte-zarr-layer/` — [carbonplan/zarr-layer](https://github.com/carbonplan/zarr-layer)
    for MapLibre.
+3. `vue-deckgl-raster/` — the same deck.gl-raster stack as (1), ported to Vue
+   3 instead of Svelte, to compare how the two frameworks' reactivity models
+   handle the same problem.
 
 ---
 
@@ -354,6 +357,111 @@ a minimal comparison SPA.
 | Animation cost | one texture upload per chunk covering *all* frames; per-frame cost is a uniform change | one fetch + render per `setSelector()` call — no frame buffering |
 | Lines of app-specific code needed | more (own shader modules, texture upload, render pipeline) | less (declarative options + a few setters) |
 | What you give up for the simplicity | fine-grained GPU control (custom filter/rescale/colormap composition) | `customFrag` covers most of the same ground, but animating many frames smoothly needs work-arounds zarr-layer doesn't provide out of the box |
+
+---
+
+## 3. deck.gl-raster + Vue (vs. Svelte)
+
+Same dataset, same `ZarrLayer`/`MapboxOverlay` wiring as the Svelte port —
+this section only covers what changed in translating Svelte 5 runes to Vue
+3's Composition API. Every file under `ecmwf/` and `gpu/` is a **byte-for-
+byte copy** from `svelte-deckgl-raster/`: that code was already
+framework-free, so "porting" it to Vue meant literally `cp`.
+
+### Reactivity primitive mapping
+
+| Svelte 5 (runes) | Vue 3 (Composition API) |
+|---|---|
+| `$state(x)` | `ref(x)` |
+| `$derived(expr)` | `computed(() => expr)` |
+| `$effect(fn)` (returns a cleanup fn) | `watchEffect(fn)` — `fn` receives an `onCleanup` callback instead of returning one: `watchEffect((onCleanup) => { ...; onCleanup(() => ...) })` |
+| plain `let x` (non-reactive local) | plain `let x` (identical — both languages let you opt a variable out of reactivity by simply not wrapping it) |
+
+Both `$effect` and `watchEffect` auto-track whatever reactive state is read
+synchronously in the function body and re-run the whole function on any
+change — same mental model, same "no dependency array" ergonomics relative
+to React's `useEffect`. The only mechanical difference is *where* the
+cleanup hook lives (return value vs. an injected callback param).
+
+### `ref()` vs `shallowRef()` — a Vue-specific gotcha with no Svelte equivalent
+
+Vue's `ref()` deep-wraps whatever you put in it with a reactive `Proxy`, recursively,
+so that mutating a nested property anywhere inside is also tracked. That's
+usually desirable for plain data, but this app's reactive state is mostly
+*handles to opaque GPU/host objects* — a `zarr.Array`, a luma.gl `Device`, a
+`Texture`, a browser `ImageData`. Deep-proxying those is pure overhead at
+best (Vue has to walk and wrap every property, including ones on classes it
+knows nothing about) and a correctness risk at worst (proxied access to a
+WebGL-backed object could behave differently from direct access if the
+object relies on `this`-identity or private internal slots anywhere in its
+prototype chain).
+
+The port uses `shallowRef()` for every one of these: `arr`, `device`,
+`colormapTexture`, `colormapImage`. `shallowRef` tracks only whole-reference
+reassignment (`.value = newThing`), never touching `newThing`'s internals —
+exactly the granularity this code actually needs, since nothing ever mutates
+a property *inside* a Device or Texture; it only ever swaps the whole
+reference. Plain `ref()` is kept for genuinely-plain reactive primitives
+(`leadTimeIdx`, `rescaleMin`, etc.).
+
+Svelte 5's `$state` has the same deep-reactivity default (it also proxies
+objects), so in principle the Svelte port has the identical theoretical
+exposure — it just wasn't an issue in practice there either, and Svelte has
+no `shallowRef`-equivalent rune to opt out with (`$state.raw` is the closest
+match, and the Svelte port doesn't currently use it). Worth revisiting if
+either port hits a subtle GPU-object bug that disappears when the state
+wrapper is removed.
+
+### Two-way binding: `defineModel` vs. callback props
+
+The Svelte port's `ControlPanel.svelte` takes a callback prop per editable
+value (`onLeadTimeIdxChange: (idx: number) => void`, etc.) — Svelte 5 has no
+built-in two-way-binding sugar for custom components, so the original port
+wired each control by hand.
+
+Vue's `ControlPanel.vue` instead uses `defineModel()` (stable since Vue
+3.4) for every two-way-bound control:
+
+```ts
+const leadTimeIdx = defineModel<number>("leadTimeIdx", { required: true });
+```
+
+and the parent just does:
+
+```html
+<ControlPanel v-model:lead-time-idx="leadTimeIdx" ... />
+```
+
+This is strictly less code than the Svelte version's callback-prop wiring —
+no `onLeadTimeIdxChange={(v) => (leadTimeIdx = v)}` boilerplate needed on
+either side — at the cost of being more "magic": `defineModel` compiles to
+an implicit prop + an implicit `update:leadTimeIdx` emit, which isn't
+visible at the call site the way an explicit callback prop is. The
+play/pause toggle, which is an *action* rather than a value to bind, stays a
+plain `defineEmits` event (`@play-pause-toggle`) in both — `v-model` wasn't
+reached for there since there's no value to bind, only a request to flip
+one.
+
+### Everything else ports unchanged
+
+- `MapboxOverlay` wiring (`map.addControl` once, `overlay.setProps(...)`
+  wherever state changes) is exactly the same code shape as the Svelte
+  port — this part of deck.gl's API was never framework-specific to begin
+  with (see section 1).
+- The `updateTriggers` / GPU-shader-pipeline discussion from section 1
+  applies identically here; nothing about switching frameworks changes how
+  deck.gl decides whether cached tiles need re-rendering.
+- `maplibre-gl` stays pinned to `^5.24.0` here too, for the same reason as
+  the Svelte port: `@deck.gl/mapbox`'s `MapboxOverlay` doesn't yet support
+  maplibre-gl v6.
+
+### Verification status
+
+- `vue-tsc -b --noEmit`: **0 errors**.
+- Dev server boots cleanly, key modules (`/src/main.ts`, `/src/App.vue`)
+  transform without error under Vite.
+- **Not yet done**: in-browser runtime verification — same limitation as
+  both Svelte ports (no Chrome automation available this session).
 
 ---
 
